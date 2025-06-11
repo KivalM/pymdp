@@ -1,6 +1,74 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
+"""
+MMP PLANNING ALGORITHM (Marginal Message Passing)
+
+This module implements the MMP algorithm for Active Inference - a sophisticated
+temporal inference method that enables planning by reasoning about sequences of
+hidden states over time. MMP uses message passing to efficiently handle temporal
+dependencies and policy-conditioned beliefs.
+
+ALGORITHM OVERVIEW:
+==================
+
+The MMP algorithm answers the question: "Given my observations and this policy,
+what sequence of hidden states am I most likely to experience over time?"
+It combines past observations with future policy predictions to compute
+temporal state sequences.
+
+KEY CONCEPTS:
+=============
+
+1. TEMPORAL INFERENCE:
+   - Reasons about state sequences over multiple timesteps
+   - Combines past evidence (observations) with future predictions (policy)
+   - Enables planning by evaluating consequences of action sequences
+
+2. MESSAGE PASSING:
+   - Forward messages: influence of past states on current states
+   - Backward messages: influence of future states on current states  
+   - Bidirectional propagation ensures temporal consistency
+
+3. POLICY-CONDITIONED BELIEFS:
+   - Computes beliefs under specific policy: "If I follow this plan..."
+   - Each policy produces different predicted state sequences
+   - Enables comparison of different plans
+
+4. INFERENCE WINDOW:
+   - Past window: timesteps with actual observations
+   - Future window: timesteps with predicted actions
+   - Combined window enables coherent temporal reasoning
+
+MATHEMATICAL FOUNDATION:
+=======================
+
+For each timestep t and state factor f:
+q(s_t^f) ∝ exp(log_likelihood_t^f + log_past_message^f + log_future_message^f)
+
+Where:
+- log_likelihood_t^f comes from observations (if available)
+- log_past_message^f = influence from previous timesteps
+- log_future_message^f = influence from future timesteps
+
+Messages are computed using transition matrices:
+- Forward: B[f][:, :, action] × q(s_{t-1}^f)
+- Backward: B[f]^T[:, :, action] × q(s_{t+1}^f)
+
+WHEN TO USE MMP:
+===============
+
+- Planning behavior (multi-timestep inference)
+- Temporal dependencies matter
+- Policy evaluation and comparison
+- Complex environments requiring lookahead
+- When computational cost is acceptable for better planning
+
+COMPARISON TO VANILLA:
+- MMP: Planning, multi-timestep, temporal dependencies, slower
+- VANILLA: Reactive, single timestep, faster, no temporal reasoning
+"""
+
 import numpy as np
 
 from pymdp.utils import to_obj_array, get_model_dimensions, obj_array, obj_array_zeros, obj_array_uniform
@@ -10,41 +78,90 @@ import copy
 def run_mmp(
     lh_seq, B, policy, prev_actions=None, prior=None, num_iter=10, grad_descent=True, tau=0.25, last_timestep = False):
     """
-    Marginal message passing scheme for updating marginal posterior beliefs about hidden states over time, 
-    conditioned on a particular policy.
+    MMP PLANNING: Temporal State Inference for Policy Evaluation
+    
+    This is the core implementation of the MMP algorithm for Active Inference.
+    It computes policy-conditioned beliefs about hidden state sequences over time,
+    enabling the agent to evaluate the consequences of different action plans.
+    
+    THE ALGORITHM IN STEPS:
+    1. Set up inference window (past observations + future policy)
+    2. Initialize uniform beliefs for all timesteps and factors
+    3. For each iteration and timestep:
+       - Compute likelihood message (from observations, if available)
+       - Compute past message (influence from previous timestep)  
+       - Compute future message (influence from next timestep)
+       - Update beliefs by combining all messages
+    4. Return temporal sequence of beliefs and free energy
+    
+    THE BASIC IDEA:
+    Given: "I observed X yesterday, Y today, and plan to do actions [A, B, C] tomorrow"
+    Question: "What sequence of hidden states explains my observations and predicts my policy outcomes?"
+    
+    Algorithm computes: "If I follow this policy, I'll likely be in states [S1, S2, S3, S4] over time"
+    
+    TEMPORAL MESSAGE PASSING:
+    For each timestep t and factor f:
+    
+    Past Message: "What states at t-1 could have led to my beliefs at t?"
+    Future Message: "What states at t+1 do my beliefs at t predict?"
+    Likelihood: "What states at t best explain observation at t?"
+    
+    Belief Update: q(s_t) ∝ exp(likelihood + past_msg + future_msg)
+    
+    WHY MESSAGE PASSING:
+    - Forward-backward propagation ensures temporal consistency
+    - Past constrains present based on observations
+    - Future constrains present based on planned actions
+    - Bidirectional flow creates coherent temporal sequences
+    
+    WHEN TO USE:
+    - Evaluating specific policies: "What happens if I follow this plan?"
+    - Planning algorithms that compare different action sequences
+    - Environments where temporal dependencies matter
+    - When you need state predictions for future timesteps
 
     Parameters
     ----------
-    lh_seq: ``numpy.ndarray`` of dtype object
-        Log likelihoods of hidden states under a sequence of observations over time. This is assumed to already be log-transformed. Each ``lh_seq[t]`` contains
-        the log likelihood of hidden states for a particular observation at time ``t``
-    B: ``numpy.ndarray`` of dtype object
-        Dynamics likelihood mapping or 'transition model', mapping from hidden states at ``t`` to hidden states at ``t+1``, given some control state ``u``.
-        Each element ``B[f]`` of this object array stores a 3-D tensor for hidden state factor ``f``, whose entries ``B[f][s, v, u]`` store the probability
-        of hidden state level ``s`` at the current time, given hidden state level ``v`` and action ``u`` at the previous time.
-    policy: 2D ``numpy.ndarray``
-        Matrix of shape ``(policy_len, num_control_factors)`` that indicates the indices of each action (control state index) upon timestep ``t`` and control_factor ``f` in the element ``policy[t,f]`` for a given policy.
-    prev_actions: ``numpy.ndarray``, default None
-        If provided, should be a matrix of previous actions of shape ``(infer_len, num_control_factors)`` that indicates the indices of each action (control state index) taken in the past (up until the current timestep).
-    prior: ``numpy.ndarray`` of dtype object, default None
-        If provided, the prior beliefs about initial states (at t = 0, relative to ``infer_len``). If ``None``, this defaults
-        to a flat (uninformative) prior over hidden states.
-    numiter: int, default 10
-        Number of variational iterations.
-    grad_descent: Bool, default True
-        Flag for whether to use gradient descent (free energy gradient updates) instead of fixed point solution to the posterior beliefs
-    tau: float, default 0.25
-        Decay constant for use in ``grad_descent`` version. Tunes the size of the gradient descent updates to the posterior.
-    last_timestep: Bool, default False
-        Flag for whether we are at the last timestep of belief updating
+    lh_seq : numpy.ndarray of dtype object
+        Sequence of log-likelihoods for observations over time.
+        lh_seq[t] = log P(observation_t | states) for timestep t.
+        Only available for past timesteps (where observations exist).
+    B : numpy.ndarray of dtype object
+        Transition model: B[f][next_state, prev_state, action] = P(next_state | prev_state, action)
+        Describes how actions change states over time for each factor f.
+    policy : numpy.ndarray, shape (policy_len, num_control_factors)
+        Action sequence to evaluate: policy[t, f] = action for factor f at timestep t.
+        This defines the "plan" whose consequences we want to predict.
+    prev_actions : numpy.ndarray, optional
+        Previous actions already taken, shape (past_len, num_control_factors).
+        Used to connect past observations with future policy.
+    prior : numpy.ndarray of dtype object, optional
+        Prior beliefs about initial states. If None, uses uniform priors.
+        Usually comes from D vector or previous inference results.
+    num_iter : int, default 10
+        Number of message passing iterations for convergence.
+        More iterations = better convergence but higher computational cost.
+    grad_descent : bool, default True
+        Whether to use gradient descent updates (True) or fixed-point updates (False).
+        Gradient descent often more stable but slower convergence.
+    tau : float, default 0.25
+        Learning rate for gradient descent updates (if grad_descent=True).
+        Controls step size: smaller values = more stable, larger = faster.
+    last_timestep : bool, default False
+        Whether this is the final timestep of planning.
+        Affects inference window construction for computational efficiency.
         
     Returns
     ---------
-    qs_seq: ``numpy.ndarray`` of dtype object
-        Posterior beliefs over hidden states under the policy. Nesting structure is timepoints, factors,
-        where e.g. ``qs_seq[t][f]`` stores the marginal belief about factor ``f`` at timepoint ``t`` under the policy in question.
-    F: float
+    qs_seq : numpy.ndarray of dtype object
+        Policy-conditioned state beliefs over time.
+        qs_seq[t][f] = beliefs about factor f at timestep t under this policy.
+        This represents the predicted temporal sequence of hidden states.
+    F : float
         Variational free energy of the policy.
+        Lower F = better policy (more likely state sequence given observations).
+        Used for policy comparison and selection.
     """
 
     # window

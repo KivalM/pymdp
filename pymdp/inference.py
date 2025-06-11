@@ -2,6 +2,51 @@
 # -*- coding: utf-8 -*-
 # pylint: disable=no-member
 
+"""
+ACTIVE INFERENCE STATE INFERENCE MODULE
+
+This module contains the core state inference algorithms for Active Inference agents.
+These functions implement the "perception" part of the perception-action loop, where
+agents update their beliefs about hidden world states based on observations.
+
+KEY CONCEPTS:
+=============
+
+1. STATE INFERENCE:
+   - Hidden states are what's really happening in the world (true state)
+   - Observations are what the agent can sense (noisy/partial information)
+   - Inference uses Bayes' rule to estimate hidden states from observations
+
+2. INFERENCE ALGORITHMS:
+   - VANILLA: Simple, fast inference for reactive behavior
+   - MMP (Marginal Message Passing): Complex temporal inference for planning
+   - VMP (Variational Message Passing): Advanced variational methods
+   
+3. FACTORIZATION:
+   - Computational optimization for complex state spaces
+   - Breaks down large state spaces into manageable factors
+   - Enables efficient inference in high-dimensional problems
+
+MATHEMATICAL FOUNDATION:
+=======================
+
+Bayes' Rule for State Inference:
+P(hidden_state | observation) ∝ P(observation | hidden_state) × P(hidden_state)
+
+Where:
+- P(observation | hidden_state) comes from the A matrix (observation model)
+- P(hidden_state) is the prior belief (from D vector or previous timestep)
+- P(hidden_state | observation) is what we want to compute (posterior belief)
+
+For temporal sequences:
+P(states_sequence | observations_sequence) using message passing algorithms
+
+The agent seeks to minimize variational free energy:
+F = Accuracy + Complexity
+Where Accuracy = how well beliefs explain observations
+And Complexity = how much beliefs deviate from priors
+"""
+
 import numpy as np
 
 from pymdp import utils
@@ -27,7 +72,7 @@ def update_posterior_states_full(
 ):
     """
     Update posterior over hidden states using marginal message passing
-
+    Posterior P(s_t | o_1:t) = P(o_1:t | s_t) P(s_t) / P(o_1:t)
     Parameters
     ----------
     A: ``numpy.ndarray`` of dtype object
@@ -246,126 +291,241 @@ def _update_posterior_states_full_test(
 
 def average_states_over_policies(qs_pi, q_pi):
     """
-    This function computes a expected posterior over hidden states with respect to the posterior over policies, 
-    also known as the 'Bayesian model average of states with respect to policies'.
+    BAYESIAN MODEL AVERAGING: Integrating State Beliefs Across Policies
+    
+    This function combines state beliefs from different policies into a single unified belief.
+    It's used when the agent has uncertainty about which policy is best and wants to
+    compute overall state beliefs that account for this policy uncertainty.
+    
+    THE BASIC IDEA:
+    When the agent is considering multiple policies, each policy leads to different
+    beliefs about hidden states. Instead of picking one policy and ignoring the others,
+    Bayesian Model Averaging (BMA) combines all the state beliefs, weighted by how
+    much the agent believes in each policy.
+    
+    MATHEMATICAL FOUNDATION:
+    For each state factor f:
+    qs_bma[f] = Σ P(policy π) × qs[π][f]
+    
+    Where:
+    - P(policy π) is the agent's belief that policy π is optimal
+    - qs[π][f] is the belief about state factor f under policy π
+    - The sum is over all policies
+    
+    WHEN TO USE:
+    - MMP algorithm (planning with multiple policies)
+    - When agent has uncertainty about which policy is best
+    - For computing policy-independent state beliefs
+    - At boundaries of inference horizons
+    
+    EXAMPLE:
+    Policy preferences: [0.6, 0.4] for ["go-right", "go-left"]
+    State beliefs under go-right: "70% chance in room A"
+    State beliefs under go-left: "30% chance in room A"
+    BMA result: 0.6×0.7 + 0.4×0.3 = 54% chance in room A
+    (Weighted average that accounts for policy uncertainty)
 
     Parameters
     ----------
     qs_pi: ``numpy.ndarray`` of dtype object
-        Posterior beliefs over hidden states for each policy. Nesting structure is policies, factors,
-        where e.g. ``qs_pi[p][f]`` stores the marginal belief about factor ``f`` under policy ``p``.
+        Policy-conditioned state beliefs: qs_pi[p][f] = belief about factor f under policy p.
+        This is a nested array where each policy has its own set of state beliefs.
     q_pi: ``numpy.ndarray`` of dtype object
-        Posterior beliefs about policies where ``len(q_pi) = num_policies``
+        Policy preferences: q_pi[p] = probability that policy p is optimal.
+        These weights determine how much each policy contributes to the average.
+        Should sum to 1 (proper probability distribution).
 
     Returns
     ---------
     qs_bma: ``numpy.ndarray`` of dtype object
-        Marginal posterior over hidden states for the current timepoint, 
-        averaged across policies according to their posterior probability given by ``q_pi``
+        Bayesian model averaged state beliefs: qs_bma[f] = integrated belief about factor f.
+        This represents the agent's overall state beliefs after accounting for policy uncertainty.
+        Same structure as individual policy beliefs but averaged across all policies.
     """
 
-    num_factors = len(qs_pi[0]) # get the number of hidden state factors using the shape of the first-policy-conditioned posterior
-    num_states = [qs_f.shape[0] for qs_f in qs_pi[0]] # get the dimensionalities of each hidden state factor 
+    # Get model dimensions from the first policy's beliefs
+    num_factors = len(qs_pi[0])  # Number of hidden state factors
+    num_states = [qs_f.shape[0] for qs_f in qs_pi[0]]  # States per factor
 
+    # Initialize Bayesian model averaged beliefs
     qs_bma = utils.obj_array(num_factors)
     for f in range(num_factors):
         qs_bma[f] = np.zeros(num_states[f])
 
+    ### Compute Weighted Average Across Policies ###
     for p_idx, policy_weight in enumerate(q_pi):
-
         for f in range(num_factors):
-
+            # Add this policy's contribution, weighted by its probability
             qs_bma[f] += qs_pi[p_idx][f] * policy_weight
 
     return qs_bma
 
 def update_posterior_states(A, obs, prior=None, **kwargs):
     """
-    Update marginal posterior over hidden states using mean-field fixed point iteration 
-    FPI or Fixed point iteration. 
-
-    See the following links for details:
-    http://www.cs.cmu.edu/~guestrin/Class/10708/recitations/r9/VI-view.pdf, slides 13- 18, and http://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.137.221&rep=rep1&type=pdf, slides 24 - 38.
+    VANILLA STATE INFERENCE: Simple Bayesian Perception
     
+    This is the core "perception" function for Active Inference agents using the VANILLA algorithm.
+    It implements Bayes' rule to update beliefs about hidden states based on a single observation.
+    This is like asking: "Given what I just observed, what's most likely happening in the world?"
+    
+    THE BASIC IDEA:
+    The agent doesn't directly know the true hidden states (like room location, object positions).
+    It only gets observations (what it can see, hear, feel). This function uses Bayes' rule
+    to combine:
+    1. Prior beliefs (what the agent expected before seeing anything)
+    2. Observation likelihood (how likely this observation is given different states)
+    → Posterior beliefs (updated beliefs about what's actually happening)
+    
+    MATHEMATICAL FOUNDATION:
+    Bayes' rule: P(state | observation) ∝ P(observation | state) × P(state)
+    
+    Where:
+    - P(observation | state) comes from the A matrix (observation model)
+    - P(state) is the prior belief (from D vector or previous inference)
+    - P(state | observation) is the posterior we want to compute
+    
+    ALGORITHM: Fixed Point Iteration (FPI)
+    Uses mean-field variational inference with iterative updates until convergence.
+    This efficiently handles cases where state factors interact.
+    
+    WHEN TO USE:
+    - VANILLA algorithm (simple, reactive behavior)
+    - Single timestep inference (not planning ahead)
+    - When you have current observation and want current state beliefs
+    
+    EXAMPLE:
+    - Agent observes: "bright light" 
+    - Prior belief: "probably in dark room"
+    - A matrix says: "bright rooms usually produce bright light observations"
+    - Posterior: "probably in bright room" (belief updated by observation)
+
     Parameters
     ----------
     A: ``numpy.ndarray`` of dtype object
-        Sensory likelihood mapping or 'observation model', mapping from hidden states to observations. Each element ``A[m]`` of
-        stores an ``np.ndarray`` multidimensional array for observation modality ``m``, whose entries ``A[m][i, j, k, ...]`` store 
-        the probability of observation level ``i`` given hidden state levels ``j, k, ...``
+        Observation model: A[m][obs, state1, state2, ...] = P(observation | states)
+        Tells the agent what observations to expect in different hidden states.
     obs: 1D ``numpy.ndarray``, ``numpy.ndarray`` of dtype object, int or tuple
-        The observation (generated by the environment). If single modality, this can be a 1D ``np.ndarray``
-        (one-hot vector representation) or an ``int`` (observation index)
-        If multi-modality, this can be ``np.ndarray`` of dtype object whose entries are 1D one-hot vectors,
-        or a tuple (of ``int``)
+        The observation that was just received from the environment.
+        Can be:
+        - Single modality: int (observation index) or 1D array (one-hot vector)
+        - Multi-modality: tuple of ints or object array of one-hot vectors
+        Example: [0, 2] = "observation 0 for vision, observation 2 for sound"
     prior: 1D ``numpy.ndarray`` or ``numpy.ndarray`` of dtype object, default None
-        Prior beliefs about hidden states, to be integrated with the marginal likelihood to obtain
-        a posterior distribution. If not provided, prior is set to be equal to a flat categorical distribution (at the level of
-        the individual inference functions).
+        Prior beliefs about hidden states before seeing the observation.
+        If None, uses uniform (flat) priors (all states equally likely).
+        Usually comes from D vector (initial beliefs) or previous timestep.
     **kwargs: keyword arguments 
-        List of keyword/parameter arguments corresponding to parameter values for the fixed-point iteration
-        algorithm ``algos.fpi.run_vanilla_fpi.py``
+        Optional parameters for the fixed-point iteration algorithm:
+        - num_iter: maximum number of iterations
+        - dF: threshold for convergence
+        - dF_tol: tolerance for free energy changes
 
     Returns
     ----------
     qs: 1D ``numpy.ndarray`` or ``numpy.ndarray`` of dtype object
-        Marginal posterior beliefs over hidden states at current timepoint
+        Posterior beliefs about hidden states after seeing the observation.
+        qs[f] = probability distribution over states for factor f.
+        These represent the agent's updated beliefs about what's happening.
     """
 
+    # Get model dimensions
     num_obs, num_states, num_modalities, _ = utils.get_model_dimensions(A = A)
     
+    # Process observation into standard format
     obs = utils.process_observation(obs, num_modalities, num_obs)
 
+    # Process prior beliefs
     if prior is not None:
         prior = utils.to_obj_array(prior)
 
+    # Run the VANILLA inference algorithm (Fixed Point Iteration)
     return run_vanilla_fpi(A, obs, num_obs, num_states, prior, **kwargs)
 
 def update_posterior_states_factorized(A, obs, num_obs, num_states, mb_dict, prior=None, **kwargs):
     """
-    Update marginal posterior over hidden states using mean-field fixed point iteration 
-    FPI or Fixed point iteration. This version identifies the Markov blanket of each factor using `A_factor_list`
-
-    See the following links for details:
-    http://www.cs.cmu.edu/~guestrin/Class/10708/recitations/r9/VI-view.pdf, slides 13- 18, and http://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.137.221&rep=rep1&type=pdf, slides 24 - 38.
+    VANILLA STATE INFERENCE: Efficient Factorized Version
     
+    This is the computationally optimized version of the core state inference function.
+    It uses factorization to efficiently handle complex state spaces by identifying
+    which state factors actually affect which observations (Markov blankets).
+    
+    THE BASIC IDEA:
+    Same as regular VANILLA inference, but optimized for computational efficiency.
+    Instead of considering all possible state factor combinations, it identifies
+    which state factors actually matter for each observation modality.
+    
+    FACTORIZATION OPTIMIZATION:
+    In complex environments, not all state factors affect all observations:
+    - Room location might affect visual observations but not internal body state
+    - Hunger level might affect interoceptive observations but not visual observations
+    
+    By identifying these dependencies (Markov blankets), we can:
+    - Reduce computational complexity from exponential to linear
+    - Update only relevant state factors for each observation
+    - Enable efficient inference in high-dimensional state spaces
+    
+    MARKOV BLANKETS:
+    - A_factor_list[m] = which state factors affect observation modality m
+    - A_modality_list[f] = which observation modalities are affected by state factor f
+    
+    WHEN TO USE:
+    - VANILLA algorithm with complex state spaces
+    - When different observations depend on different state factors
+    - When computational efficiency is important
+    
+    EXAMPLE:
+    State factors: [room_location, hunger_level, light_switch]
+    Observations: [vision, interoception]
+    Dependencies:
+    - vision depends on [room_location, light_switch] 
+    - interoception depends on [hunger_level]
+    → Only update relevant factors for each observation type
+
     Parameters
     ----------
     A: ``numpy.ndarray`` of dtype object
-        Sensory likelihood mapping or 'observation model', mapping from hidden states to observations. Each element ``A[m]`` of
-        stores an ``np.ndarray`` multidimensional array for observation modality ``m``, whose entries ``A[m][i, j, k, ...]`` store 
-        the probability of observation level ``i`` given hidden state levels ``j, k, ...``
+        Observation model: A[m][obs, state1, state2, ...] = P(observation | states)
+        Tells the agent what observations to expect in different hidden states.
     obs: 1D ``numpy.ndarray``, ``numpy.ndarray`` of dtype object, int or tuple
-        The observation (generated by the environment). If single modality, this can be a 1D ``np.ndarray``
-        (one-hot vector representation) or an ``int`` (observation index)
-        If multi-modality, this can be ``np.ndarray`` of dtype object whose entries are 1D one-hot vectors,
-        or a tuple (of ``int``)
+        The observation that was just received from the environment.
+        Can be single or multi-modality as described in update_posterior_states.
     num_obs: ``list`` of ``int``
-        List of dimensionalities of each observation modality
+        Number of possible observations for each modality.
+        Example: [4, 3] = 4 visual observations, 3 auditory observations.
     num_states: ``list`` of ``int``
-        List of dimensionalities of each hidden state factor
+        Number of possible states for each hidden state factor.
+        Example: [5, 3, 2] = 5 rooms, 3 hunger levels, 2 switch positions.
     mb_dict: ``Dict``
-        Dictionary with two keys (``A_factor_list`` and ``A_modality_list``), that stores the factor indices that influence each modality (``A_factor_list``)
-        and the modality indices influenced by each factor (``A_modality_list``).
+        Markov blanket dictionary with keys:
+        - 'A_factor_list': which state factors affect which observation modalities
+        - 'A_modality_list': which observation modalities are affected by which state factors
+        This enables computational efficiency by avoiding unnecessary calculations.
     prior: 1D ``numpy.ndarray`` or ``numpy.ndarray`` of dtype object, default None
-        Prior beliefs about hidden states, to be integrated with the marginal likelihood to obtain
-        a posterior distribution. If not provided, prior is set to be equal to a flat categorical distribution (at the level of
-        the individual inference functions).
+        Prior beliefs about hidden states before seeing the observation.
+        If None, uses uniform (flat) priors (all states equally likely).
     **kwargs: keyword arguments 
-        List of keyword/parameter arguments corresponding to parameter values for the fixed-point iteration
-        algorithm ``algos.fpi.run_vanilla_fpi.py``
+        Optional parameters for the factorized fixed-point iteration algorithm:
+        - num_iter: maximum number of iterations
+        - dF: threshold for convergence
+        - dF_tol: tolerance for free energy changes
 
     Returns
     ----------
     qs: 1D ``numpy.ndarray`` or ``numpy.ndarray`` of dtype object
-        Marginal posterior beliefs over hidden states at current timepoint
+        Posterior beliefs about hidden states after seeing the observation.
+        qs[f] = probability distribution over states for factor f.
+        Same output as regular inference but computed more efficiently.
     """
     
+    # Get number of modalities
     num_modalities = len(num_obs)
     
+    # Process observation into standard format
     obs = utils.process_observation(obs, num_modalities, num_obs)
 
+    # Process prior beliefs
     if prior is not None:
         prior = utils.to_obj_array(prior)
 
+    # Run the factorized VANILLA inference algorithm
     return run_vanilla_fpi_factorized(A, obs, num_obs, num_states, mb_dict, prior, **kwargs)

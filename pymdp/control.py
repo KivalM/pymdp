@@ -3,6 +3,51 @@
 # pylint: disable=no-member
 # pylint: disable=not-an-iterable
 
+"""
+ACTIVE INFERENCE CONTROL MODULE
+
+This module contains the core decision-making and planning algorithms for Active Inference agents.
+It implements the key functions for policy evaluation, action selection, and planning that allow
+agents to choose actions that minimize Expected Free Energy.
+
+KEY CONCEPTS:
+=============
+
+1. POLICY EVALUATION:
+   - Policies are sequences of actions over time
+   - Each policy is evaluated by computing its "Expected Free Energy" (EFE)
+   - Lower EFE = better policy (less expected "surprise" or "cost")
+
+2. EXPECTED FREE ENERGY COMPONENTS:
+   - Expected Utility: How much the agent expects to like future observations
+   - State Information Gain: How much the agent expects to learn about world states
+   - Parameter Information Gain: How much the agent expects to learn about model parameters
+
+3. ACTION SELECTION:
+   - Convert policy preferences into specific actions
+   - Can either integrate over policy uncertainty or commit to one policy
+
+4. PLANNING ALGORITHMS:
+   - VANILLA: Simple one-step planning
+   - MMP: Multi-timestep planning with message passing
+   - Sophisticated: Tree search for deep planning
+
+MATHEMATICAL FOUNDATION:
+=======================
+
+Expected Free Energy for policy π:
+G(π) = Expected_Utility(π) + Information_Gain(π)
+
+Where:
+- Expected_Utility(π) = Σ P(o|π) × log P(o|π) - Σ P(o|π) × C(o)
+- Information_Gain(π) = Σ P(o|π) × DKL[P(s|o,π) || P(s|π)]
+
+Policy selection probability:
+P(π) ∝ exp(-γ × G(π) + ln E(π))
+
+Where γ is policy precision and E(π) is the policy prior.
+"""
+
 import itertools
 import numpy as np
 from pymdp.maths import softmax, softmax_obj_arr, spm_dot, spm_wnorm, spm_MDP_G, spm_log_single, kl_div, entropy
@@ -379,90 +424,147 @@ def update_posterior_policies_factorized(
     gamma=16.0
 ):
     """
-    Update posterior beliefs about policies by computing expected free energy of each policy and integrating that
-    with the prior over policies ``E``. This is intended to be used in conjunction
-    with the ``update_posterior_states`` method of the ``inference`` module, since only the posterior about the hidden states at the current timestep
-    ``qs`` is assumed to be provided, unconditional on policies. The predictive posterior over hidden states under all policies Q(s, pi) is computed 
-    using the starting posterior about states at the current timestep ``qs`` and the generative model (e.g. ``A``, ``B``, ``C``)
+    POLICY EVALUATION: The Core Decision-Making Algorithm
+    
+    This is the heart of Active Inference decision-making. Given the agent's current beliefs
+    about world states, this function evaluates all possible policies (action sequences) by
+    computing their "Expected Free Energy" and determines which policies are most attractive.
+    
+    THE BASIC IDEA:
+    For each possible policy (sequence of actions), the agent:
+    1. Simulates forward: "If I follow this policy, what states would I expect to visit?"
+    2. Predicts observations: "What would I expect to see in those states?"
+    3. Evaluates cost: "How much would I like those observations? How much would I learn?"
+    4. Chooses policies that minimize expected cost (maximize value + information gain)
+    
+    MATHEMATICAL FOUNDATION:
+    For each policy π, compute Expected Free Energy:
+    G(π) = Expected_Utility(π) + State_Info_Gain(π) + Parameter_Info_Gain(π)
+    
+    Then policy preferences:
+    P(π) ∝ exp(-γ × G(π) + ln E(π))
+    
+    Where:
+    - Lower G(π) = better policy (less expected "surprise")
+    - γ (gamma) = policy precision (how confident in policy choices)
+    - E(π) = policy priors (habitual biases toward certain policies)
+    
+    COMPONENTS EXPLAINED:
+    - Expected Utility: How much the agent expects to like future observations under the policy
+    - State Info Gain: How much the agent expects to learn about hidden world states
+    - Parameter Info Gain: How much the agent expects to learn about model parameters
+    
+    EXAMPLE:
+    - Policy A: "Move to kitchen" → Expect to see food (high utility) + learn room layout (high info gain)
+    - Policy B: "Stay still" → No food (low utility) + learn nothing (low info gain)
+    - Agent prefers Policy A because it has lower Expected Free Energy
 
     Parameters
     ----------
     qs: ``numpy.ndarray`` of dtype object
-        Marginal posterior beliefs over hidden states at current timepoint (unconditioned on policies)
+        Current beliefs about hidden states (where the agent thinks it is right now).
+        This is the starting point for simulating all policies forward in time.
     A: ``numpy.ndarray`` of dtype object
-        Sensory likelihood mapping or 'observation model', mapping from hidden states to observations. Each element ``A[m]`` of
-        stores an ``numpy.ndarray`` multidimensional array for observation modality ``m``, whose entries ``A[m][i, j, k, ...]`` store 
-        the probability of observation level ``i`` given hidden state levels ``j, k, ...``
+        Observation model: A[m][obs, state1, state2, ...] = P(observation | states)
+        Tells agent what observations to expect in different states.
     B: ``numpy.ndarray`` of dtype object
-        Dynamics likelihood mapping or 'transition model', mapping from hidden states at ``t`` to hidden states at ``t+1``, given some control state ``u``.
-        Each element ``B[f]`` of this object array stores a 3-D tensor for hidden state factor ``f``, whose entries ``B[f][s, v, u]`` store the probability
-        of hidden state level ``s`` at the current time, given hidden state level ``v`` and action ``u`` at the previous time.
+        Transition model: B[f][next_state, current_state, action] = P(next_state | current_state, action)
+        Tells agent how actions change states over time.
     C: ``numpy.ndarray`` of dtype object
-       Prior over observations or 'prior preferences', storing the "value" of each outcome in terms of relative log probabilities. 
-       This is softmaxed to form a proper probability distribution before being used to compute the expected utility term of the expected free energy.
+        Preferences: C[m][obs] = log preference for observation
+        Tells agent which observations it "likes" or "wants" to see.
     A_factor_list: ``list`` of ``list``s of ``int``
-        ``list`` that stores the indices of the hidden state factor indices that each observation modality depends on. For example, if ``A_factor_list[m] = [0, 1]``, then
-        observation modality ``m`` depends on hidden state factors 0 and 1.
+        Efficiency optimization: which hidden state factors affect which observations.
+        Example: [[0, 1], [2]] means observation 0 depends on states 0&1, observation 1 depends on state 2.
     B_factor_list: ``list`` of ``list``s of ``int``
-        ``list`` that stores the indices of the hidden state factor indices that each hidden state factor depends on. For example, if ``B_factor_list[f] = [0, 1]``, then
-        the transitions in hidden state factor ``f`` depend on hidden state factors 0 and 1.
+        Efficiency optimization: which hidden state factors affect which state transitions.
+        Example: [[0], [0, 1]] means factor 0 only depends on itself, factor 1 depends on factors 0&1.
     policies: ``list`` of 2D ``numpy.ndarray``
-        ``list`` that stores each policy in ``policies[p_idx]``. Shape of ``policies[p_idx]`` is ``(num_timesteps, num_factors)`` where `num_timesteps` is the temporal
-        depth of the policy and ``num_factors`` is the number of control factors.
-    use_utility: ``Bool``, default ``True``
-        Boolean flag that determines whether expected utility should be incorporated into computation of EFE.
-    use_states_info_gain: ``Bool``, default ``True``
-        Boolean flag that determines whether state epistemic value (info gain about hidden states) should be incorporated into computation of EFE.
-    use_param_info_gain: ``Bool``, default ``False`` 
-        Boolean flag that determines whether parameter epistemic value (info gain about generative model parameters) should be incorporated into computation of EFE.
+        All action sequences to evaluate. Each policy[i] is a matrix where
+        policy[i][t, f] = action for factor f at timestep t.
+    use_utility: ``bool``, default True
+        Whether to consider preferences (goals) when evaluating policies.
+        True = agent seeks preferred observations, False = agent ignores preferences.
+    use_states_info_gain: ``bool``, default True
+        Whether to consider information gain about states when evaluating policies.
+        True = agent seeks to learn about world states, False = agent ignores learning.
+    use_param_info_gain: ``bool``, default False
+        Whether to consider information gain about model parameters when evaluating policies.
+        True = agent seeks to learn about its models, False = agent ignores model learning.
     pA: ``numpy.ndarray`` of dtype object, optional
-        Dirichlet parameters over observation model (same shape as ``A``)
+        Uncertainty about observation model (for parameter learning).
     pB: ``numpy.ndarray`` of dtype object, optional
-        Dirichlet parameters over transition model (same shape as ``B``)
+        Uncertainty about transition model (for parameter learning).
     E: 1D ``numpy.ndarray``, optional
-        Vector of prior probabilities of each policy (what's referred to in the active inference literature as "habits")
-    I: ``numpy.ndarray`` of dtype object
-        For each state factor, contains a 2D ``numpy.ndarray`` whose element i,j yields the probability 
-        of reaching the goal state backwards from state j after i steps.
+        Policy priors ("habits"): E[i] = prior probability of policy i.
+        Higher values = agent is biased toward that policy regardless of EFE.
+    I: ``numpy.ndarray`` of dtype object, optional
+        Goal-oriented planning: backwards reachability probabilities for goal states.
     gamma: float, default 16.0
-        Prior precision over policies, scales the contribution of the expected free energy to the posterior over policies
+        Policy precision: how confident the agent is in its policy evaluations.
+        Higher γ = more deterministic policy choice, Lower γ = more exploratory policy choice.
 
     Returns
     ----------
     q_pi: 1D ``numpy.ndarray``
-        Posterior beliefs over policies, i.e. a vector containing one posterior probability per policy.
+        Policy preferences: q_pi[i] = probability that policy i is best.
+        These are normalized probabilities that sum to 1.
     G: 1D ``numpy.ndarray``
-        Negative expected free energies of each policy, i.e. a vector containing one negative expected free energy per policy.
+        Expected Free Energy values: G[i] = negative expected free energy of policy i.
+        Higher G = better policy (lower expected cost).
     """
 
     n_policies = len(policies)
-    G = np.zeros(n_policies)
-    q_pi = np.zeros((n_policies, 1))
+    G = np.zeros(n_policies)         # Expected Free Energy for each policy
+    q_pi = np.zeros((n_policies, 1)) # Policy preferences
 
+    ### Setup Policy Priors ###
     if E is None:
+        # Default: uniform priors (no bias toward any policy)
         lnE = spm_log_single(np.ones(n_policies) / n_policies)
     else:
+        # Use provided policy priors (habits)
         lnE = spm_log_single(E) 
 
+    ### Evaluate Each Policy ###
     for idx, policy in enumerate(policies):
+        
+        # STEP 1: Simulate forward to get expected states under this policy
+        # "If I follow this policy, what states would I visit over time?"
         qs_pi = get_expected_states_interactions(qs, B, B_factor_list, policy)
+        
+        # STEP 2: Predict observations in those expected states
+        # "In those states, what observations would I expect to see?"
         qo_pi = get_expected_obs_factorized(qs_pi, A, A_factor_list)
 
+        ### EXPECTED FREE ENERGY COMPONENT 1: Expected Utility ###
         if use_utility:
+            # "How much would I like the observations I expect to see?"
             G[idx] += calc_expected_utility(qo_pi, C)
 
+        ### EXPECTED FREE ENERGY COMPONENT 2: State Information Gain ###
         if use_states_info_gain:
+            # "How much would I learn about world states from these observations?"
             G[idx] += calc_states_info_gain_factorized(A, qs_pi, A_factor_list)
 
+        ### EXPECTED FREE ENERGY COMPONENT 3: Parameter Information Gain ###
         if use_param_info_gain:
+            # "How much would I learn about my model parameters?"
             if pA is not None:
+                # Learning about observation model
                 G[idx] += calc_pA_info_gain_factorized(pA, qo_pi, qs_pi, A_factor_list).item()
             if pB is not None:
+                # Learning about transition model
                 G[idx] += calc_pB_info_gain_interactions(pB, qs_pi, qs, B_factor_list, policy).item()
         
+        ### EXPECTED FREE ENERGY COMPONENT 4: Goal-Oriented Planning ###
         if I is not None:
+            # "How well does this policy help me reach my goal states?"
             G[idx] += calc_inductive_cost(qs, qs_pi, I)
 
+    ### Convert Expected Free Energy to Policy Preferences ###
+    # Apply softmax with policy precision and priors
+    # P(π) ∝ exp(-γ × G(π) + ln E(π))
     q_pi = softmax(G * gamma + lnE)    
 
     return q_pi, G
@@ -1016,51 +1118,98 @@ def get_num_controls_from_policies(policies):
 
 def sample_action(q_pi, policies, num_controls, action_selection="deterministic", alpha = 16.0):
     """
-    Computes the marginal posterior over actions and then samples an action from it, one action per control factor.
+    ACTION SELECTION: Converting Policy Preferences to Concrete Actions
+    
+    This function takes the agent's preferences over policies (computed by policy evaluation)
+    and converts them into a specific action to take right now. This is the final step
+    in the Active Inference decision-making process.
+    
+    THE BASIC IDEA:
+    The agent has evaluated all policies and knows which ones it prefers. But it needs to
+    decide what specific action to take RIGHT NOW. There are two approaches:
+    
+    1. MARGINAL APPROACH (Default):
+       - Look at all preferred policies and see what first action they recommend
+       - Weight each action by how much the agent likes policies that start with that action
+       - Choose the action that appears most frequently in good policies
+       
+    2. POLICY SAMPLING APPROACH:
+       - Pick one complete policy based on preferences
+       - Take the first action from that chosen policy
+    
+    This function implements the marginal approach - it integrates over policy uncertainty.
+    
+    MATHEMATICAL FOUNDATION:
+    For each possible action a:
+    P(action = a) = Σ P(policy π) × δ(first_action_of_π = a)
+    
+    Where δ is an indicator function (1 if true, 0 if false).
+    
+    Then either:
+    - Deterministic: Choose action with highest P(action = a)
+    - Stochastic: Sample from P(action = a) using temperature α
+    
+    EXAMPLE:
+    Policy preferences: [0.6, 0.3, 0.1] for policies ["right-then-up", "left-then-down", "right-then-down"]
+    Action marginals: P(right) = 0.6 + 0.1 = 0.7, P(left) = 0.3
+    Chosen action: "right" (highest marginal probability)
 
     Parameters
     ----------
     q_pi: 1D ``numpy.ndarray``
-        Posterior beliefs over policies, i.e. a vector containing one posterior probability per policy.
+        Policy preferences: q_pi[i] = probability that policy i is optimal.
+        These come from the policy evaluation function and sum to 1.
     policies: ``list`` of 2D ``numpy.ndarray``
-        ``list`` that stores each policy as a 2D array in ``policies[p_idx]``. Shape of ``policies[p_idx]`` 
-        is ``(num_timesteps, num_factors)`` where ``num_timesteps`` is the temporal
-        depth of the policy and ``num_factors`` is the number of control factors.
+        All policies being considered. Each policy[i] is a matrix where
+        policy[i][t, f] = action for factor f at timestep t.
+        Only the first timestep (t=0) matters for immediate action selection.
     num_controls: ``list`` of ``int``
-        ``list`` of the dimensionalities of each control state factor.
+        Number of possible actions for each control factor.
+        Example: [3, 2] means factor 0 has 3 actions, factor 1 has 2 actions.
     action_selection: ``str``, default "deterministic"
-        String indicating whether whether the selected action is chosen as the maximum of the posterior over actions,
-        or whether it's sampled from the posterior marginal over actions
+        How to choose the final action:
+        - "deterministic": Always pick action with highest marginal probability
+        - "stochastic": Sample from action marginals using temperature α
     alpha: ``float``, default 16.0
-        Action selection precision -- the inverse temperature of the softmax that is used to scale the 
-        action marginals before sampling. This is only used if ``action_selection`` argument is "stochastic"
+        Action selection precision (inverse temperature for stochastic selection).
+        Higher α = more deterministic (always pick best action)
+        Lower α = more random (explore different actions)
+        Only used when action_selection="stochastic"
    
     Returns
     ----------
     selected_policy: 1D ``numpy.ndarray``
-        Vector containing the indices of the actions for each control factor
+        The chosen action: selected_policy[f] = action_index for control factor f.
+        Example: [1, 0] means "take action 1 for factor 0, action 0 for factor 1"
     """
 
     num_factors = len(num_controls)
 
+    # Initialize action marginals: How much does the agent prefer each action?
     action_marginals = utils.obj_array_zeros(num_controls)
 
-    # weight each action according to its integrated posterior probability under all policies at the current timestep
+    ### STEP 1: Compute Action Marginals by Integrating Over Policies ###
+    # For each action, sum up the preferences of all policies that start with that action
     for pol_idx, policy in enumerate(policies):
-        for factor_i, action_i in enumerate(policy[0, :]):
+        for factor_i, action_i in enumerate(policy[0, :]):  # policy[0,:] = first timestep actions
+            # Add this policy's preference to the marginal for this action
             action_marginals[factor_i][action_i] += q_pi[pol_idx]
     
+    # Normalize to get proper probability distributions
     action_marginals = utils.norm_dist_obj_arr(action_marginals)
 
+    ### STEP 2: Select Specific Actions for Each Control Factor ###
     selected_policy = np.zeros(num_factors)
     for factor_i in range(num_factors):
 
-        # Either you do this:
         if action_selection == 'deterministic':
+            # Choose the action with highest marginal probability
             selected_policy[factor_i] = select_highest(action_marginals[factor_i])
+            
         elif action_selection == 'stochastic':
+            # Sample from the action marginals using temperature scaling
             log_marginal_f = spm_log_single(action_marginals[factor_i])
-            p_actions = softmax(log_marginal_f * alpha)
+            p_actions = softmax(log_marginal_f * alpha)  # Apply temperature α
             selected_policy[factor_i] = utils.sample(p_actions)
 
     return selected_policy

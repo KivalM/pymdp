@@ -3,7 +3,52 @@
 # pylint: disable=no-member
 # pylint: disable=not-an-iterable
 
-""" Functions
+"""
+ACTIVE INFERENCE MATHEMATICAL UTILITIES MODULE
+
+This module contains the core mathematical functions and operations used throughout
+the Active Inference framework. These functions implement the mathematical foundations
+that enable perception, planning, learning, and action selection.
+
+KEY MATHEMATICAL CONCEPTS:
+=========================
+
+1. TENSOR OPERATIONS:
+   - spm_dot: Multidimensional dot products for belief updates
+   - spm_cross: Outer products for evidence computation
+   - Efficient tensor contractions for high-dimensional problems
+
+2. PROBABILITY OPERATIONS:
+   - softmax: Converting unnormalized scores to probabilities
+   - spm_norm: Normalizing probability distributions
+   - spm_log: Safe logarithms that avoid numerical issues
+
+3. INFORMATION THEORY:
+   - entropy: Measuring uncertainty in probability distributions
+   - kl_div: Measuring differences between probability distributions
+   - Free energy computations for Active Inference
+
+4. BAYESIAN LEARNING:
+   - Dirichlet operations for parameter learning
+   - Log evidence computations for model comparison
+   - Likelihood functions for observation models
+
+NUMERICAL STABILITY:
+===================
+
+Many functions include safeguards for numerical stability:
+- EPS_VAL = 1e-16 prevents log(0) and division by zero
+- Normalization ensures probabilities sum to 1
+- Careful handling of very small and very large numbers
+
+MATHEMATICAL FOUNDATION:
+=======================
+
+These functions implement the mathematics behind:
+- Bayes' rule: P(state|obs) ∝ P(obs|state) × P(state)
+- Free Energy: F = Accuracy + Complexity
+- Policy evaluation: G(π) = Expected_Utility + Information_Gain
+- Parameter learning: qParam_new = qParam_old + evidence
 
 __author__: Conor Heins, Alexander Tschantz, Brennan Klein
 """
@@ -195,22 +240,53 @@ def spm_dot_old(X, x, dims_to_omit=None, obs_mode=False):
 
 
 def spm_cross(x, y=None, *args):
-    """ Multi-dimensional outer product
+    """
+    OUTER PRODUCT: The Foundation of Learning Evidence
     
+    This function computes multidimensional outer products, which are fundamental
+    to Active Inference learning. The outer product creates the "evidence" that
+    gets added to Dirichlet parameters during learning.
+    
+    THE BASIC IDEA:
+    When the agent experiences: "I was in state X and observed Y"
+    The learning evidence is: outer_product(observation_Y, state_belief_X)
+    This evidence matrix shows which (observation, state) combinations occurred.
+    
+    MATHEMATICAL FOUNDATION:
+    For vectors x and y:
+    outer_product(x, y)[i,j] = x[i] × y[j]
+    
+    This creates a matrix where entry (i,j) represents the "strength of evidence"
+    for the combination of x[i] and y[j] occurring together.
+    
+    LEARNING APPLICATIONS:
+    - A matrix learning: outer_product(observation, state_belief)
+    - B matrix learning: outer_product(current_state_belief, previous_state_belief)
+    - Creates evidence matrices that get added to Dirichlet parameters
+    
+    EXAMPLE:
+    observation = [0, 1, 0] (observed option 2 out of 3)
+    state_belief = [0.8, 0.2] (80% chance in state 1, 20% in state 2)
+    evidence = outer_product gives:
+    [[0×0.8, 0×0.2], [1×0.8, 1×0.2], [0×0.8, 0×0.2]] = [[0, 0], [0.8, 0.2], [0, 0]]
+    → Strong evidence for observation 2 occurring in both states, weighted by belief
+
     Parameters
     ----------
-    - `x` [np.ndarray] || [Categorical] (optional)
-        The values to perfrom the outer-product with. If empty, then the outer-product 
-        is taken between x and itself. If y is not empty, then outer product is taken 
-        between x and the various dimensions of y.
-    - `args` [np.ndarray] || [Categorical] (optional)
-        Remaining arrays to perform outer-product with. These extra arrays are recursively 
-        multiplied with the 'initial' outer product (that between X and x).
+    x : np.ndarray or object array
+        First array for outer product. If y is None, computes outer product of x with itself.
+        Can be a single array or object array of multiple arrays.
+    y : np.ndarray or object array, optional
+        Second array for outer product. If provided, computes outer product between x and y.
+    *args : np.ndarray or object array, optional
+        Additional arrays for recursive outer products. Each additional array is multiplied
+        with the result of the previous outer products.
     
     Returns
     -------
-    - `z` [np.ndarray] || [Categorical]
-          The result of the outer-product
+    z : np.ndarray
+        The result of the multidimensional outer product.
+        Shape is the concatenation of all input array shapes.
     """
 
     if len(args) == 0 and y is None:

@@ -1,7 +1,64 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-""" Utility functions
+"""
+ACTIVE INFERENCE UTILITY FUNCTIONS MODULE
+
+This module contains essential utility functions that support all aspects of Active Inference.
+These functions handle data structures, array operations, model construction, and
+visualization - the foundational building blocks that make Active Inference agents work.
+
+KEY CATEGORIES:
+===============
+
+1. DATA STRUCTURES:
+   - Object arrays: Managing multi-dimensional probability distributions
+   - Dimensions class: Organizing model sizes and shapes
+   - Conversion utilities: Between different data formats
+
+2. PROBABILITY OPERATIONS:
+   - Sampling: Drawing from categorical distributions
+   - Normalization: Ensuring proper probability distributions
+   - Initialization: Creating uniform, random, or zero distributions
+
+3. MODEL CONSTRUCTION:
+   - A matrix builders: Random and structured observation models
+   - B matrix builders: Controllable and random transition models
+   - Template functions: Starting points for custom models
+
+4. DATA PROCESSING:
+   - Observation processing: Converting observations to standard formats
+   - Model dimension extraction: Getting sizes from existing models
+   - Array manipulations: Reshaping and restructuring data
+
+5. VISUALIZATION:
+   - Belief plotting: Visualizing probability distributions
+   - Model visualization: Understanding observation and transition models
+
+OBJECT ARRAYS:
+==============
+
+A fundamental concept in pymdp is the "object array" - a numpy array where each
+element contains another array. This allows us to handle models with different
+sized factors efficiently:
+
+Example: 3 rooms, 2 switch positions, 4 hunger levels
+→ Object array with 3 elements: [room_beliefs, switch_beliefs, hunger_beliefs]
+→ room_beliefs.shape = (3,), switch_beliefs.shape = (2,), hunger_beliefs.shape = (4,)
+
+This structure is used throughout for:
+- qs: Beliefs about hidden state factors
+- A: Observation models for different modalities
+- B: Transition models for different factors
+- C: Preferences for different modalities
+
+MATHEMATICAL OPERATIONS:
+=======================
+
+Key utilities implement:
+- Sampling: Converting probabilities to concrete choices
+- Normalization: Ensuring distributions sum to 1
+- Construction: Building properly shaped probability tensors
 
 __author__: Conor Heins, Alexander Tschantz, Brennan Klein
 """
@@ -18,42 +75,129 @@ EPS_VAL = 1e-16 # global constant for use in norm_dist()
 
 class Dimensions(object):
     """
-    The Dimensions class stores all data related to the size and shape of a model.
+    MODEL DIMENSIONS: Organizing Active Inference Model Structure
+    
+    This class stores all the dimensional information about an Active Inference model.
+    It's like a "blueprint" that specifies the sizes and shapes of all the components
+    that make up an agent's understanding of its world.
+    
+    THE BASIC IDEA:
+    Active Inference models have multiple dimensions that need to be coordinated:
+    - How many different things can the agent observe?
+    - How many hidden states exist in the world?
+    - How many actions can the agent take?
+    
+    This class keeps track of all these dimensions in one organized place.
+    
+    EXAMPLE USAGE:
+    For a robot navigating rooms with light switches:
+    - num_observations = [4, 2] (4 visual observations, 2 sound levels)
+    - num_observation_modalities = 2 (vision + sound)
+    - num_states = [3, 2] (3 rooms, 2 switch positions)
+    - num_state_factors = 2 (room location + switch state)
+    - num_controls = [5, 2] (5 movement actions, 2 switch actions)
+    - num_control_factors = 2 (movement + switch control)
+    
+    WHY IT MATTERS:
+    Having organized dimensions ensures:
+    - Proper matrix and vector shapes throughout the model
+    - Consistent indexing across all components
+    - Easy model validation and debugging
+    - Clear documentation of model structure
     """
     def __init__(
         self,
-        num_observations=None,
-        num_observation_modalities=0,
-        num_states=None,
-        num_state_factors=0,
-        num_controls=None,
-        num_control_factors=0,
+        num_observations=None,      # [list] Number of observation levels per modality
+        num_observation_modalities=0,  # [int] Number of observation modalities (vision, sound, etc.)
+        num_states=None,           # [list] Number of states per hidden factor  
+        num_state_factors=0,       # [int] Number of hidden state factors
+        num_controls=None,         # [list] Number of actions per control factor
+        num_control_factors=0,     # [int] Number of control factors
     ):
-        self.num_observations=num_observations
-        self.num_observation_modalities=num_observation_modalities
-        self.num_states=num_states
-        self.num_state_factors=num_state_factors
-        self.num_controls=num_controls
-        self.num_control_factors=num_control_factors
+        self.num_observations=num_observations           # How many things can be observed
+        self.num_observation_modalities=num_observation_modalities  # How many sensory channels
+        self.num_states=num_states                      # How many states per factor
+        self.num_state_factors=num_state_factors        # How many state factors
+        self.num_controls=num_controls                  # How many actions per factor
+        self.num_control_factors=num_control_factors    # How many control factors
         
 
 def sample(probabilities):
+    """
+    SAMPLING: Converting Probabilities to Actions
+    
+    This function takes a probability distribution and samples a concrete choice from it.
+    It's how Active Inference agents convert their beliefs about the best actions
+    into actual action selections.
+    
+    THE BASIC IDEA:
+    Given probabilities [0.1, 0.7, 0.2], this function will:
+    - Choose option 0 with 10% probability
+    - Choose option 1 with 70% probability  
+    - Choose option 2 with 20% probability
+    
+    And return the actual choice (0, 1, or 2).
+    
+    MATHEMATICAL FOUNDATION:
+    Uses the multinomial distribution to sample from categorical probabilities.
+    This ensures the sampling respects the probability weights.
+    
+    EXAMPLE:
+    action_probs = [0.1, 0.7, 0.2]  # Preferences for 3 actions
+    chosen_action = sample(action_probs)  # Returns 0, 1, or 2
+    # Most likely to return 1 (index of highest probability)
+    """
     probabilities = probabilities.squeeze() if len(probabilities) > 1 else probabilities
     sample_onehot = np.random.multinomial(1, probabilities)
     return np.where(sample_onehot == 1)[0][0]
 
 def sample_obj_array(arr):
-    """ 
-    Sample from set of Categorical distributions, stored in the sub-arrays of an object array 
+    """
+    MULTI-FACTOR SAMPLING: Sampling from Multiple Distributions
+    
+    This function samples from multiple categorical distributions simultaneously.
+    It's used when an agent needs to sample actions for multiple control factors
+    at the same time.
+    
+    THE BASIC IDEA:
+    For an agent with multiple control factors (movement + switch), this function
+    samples one action for each factor based on their respective probability distributions.
+    
+    EXAMPLE:
+    movement_probs = [0.1, 0.8, 0.1]  # Probabilities for [left, forward, right]
+    switch_probs = [0.9, 0.1]         # Probabilities for [no_action, flip_switch]
+    obj_arr = [movement_probs, switch_probs]
+    
+    actions = sample_obj_array(obj_arr)  
+    # Returns something like [1, 0] = [forward, no_action]
     """
     
     samples = [sample(arr_i) for arr_i in arr]
-
     return samples
 
 def obj_array(num_arr):
     """
-    Creates a generic object array with the desired number of sub-arrays, given by `num_arr`
+    OBJECT ARRAY CREATION: Building Multi-Factor Data Structures
+    
+    Creates an empty object array with the specified number of sub-arrays.
+    This is the foundation for storing multi-factor models in Active Inference.
+    
+    THE BASIC IDEA:
+    Instead of trying to fit everything into a single massive array, Active Inference
+    uses object arrays where each element can have different dimensions. This allows
+    efficient handling of models with factors of different sizes.
+    
+    EXAMPLE:
+    For a model with 3 factors (room, switch, hunger):
+    qs = obj_array(3)
+    qs[0] = room_beliefs    # Shape: (5,) for 5 rooms
+    qs[1] = switch_beliefs  # Shape: (2,) for 2 switch states  
+    qs[2] = hunger_beliefs  # Shape: (4,) for 4 hunger levels
+    
+    WHY OBJECT ARRAYS:
+    - Efficiency: No need to pad smaller factors with zeros
+    - Clarity: Each factor's beliefs are clearly separated
+    - Flexibility: Easy to add/remove factors or change their sizes
     """
     return np.empty(num_arr, dtype=object)
 

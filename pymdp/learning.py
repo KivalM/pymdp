@@ -2,6 +2,63 @@
 # -*- coding: utf-8 -*-
 # pylint: disable=no-member
 
+"""
+ACTIVE INFERENCE LEARNING MODULE
+
+This module contains the parameter learning algorithms for Active Inference agents.
+These functions implement the "adaptation" part of the perception-action-learning cycle,
+where agents update their internal models based on experience.
+
+KEY CONCEPTS:
+=============
+
+1. PARAMETER LEARNING:
+   - Agents start with initial beliefs about their models (A, B, D matrices)
+   - As they experience the world, they update these model parameters
+   - Learning uses Bayesian updates with Dirichlet distributions
+
+2. DIRICHLET DISTRIBUTIONS:
+   - Mathematical framework for learning probability distributions
+   - Dirichlet parameters represent "pseudo-counts" or "virtual experiences"
+   - Higher values = more confident in those model parameters
+   - Learning adds evidence to these pseudo-counts
+
+3. TYPES OF LEARNING:
+   - A matrix learning: "What observations do I see in different states?"
+   - B matrix learning: "How do my actions change states over time?"
+   - D vector learning: "What states do episodes typically start in?"
+
+4. FACTORIZATION:
+   - Computational optimization for complex models
+   - Only update parameters that are actually relevant
+   - Enables efficient learning in high-dimensional spaces
+
+MATHEMATICAL FOUNDATION:
+=======================
+
+Dirichlet Update Rule:
+qParam_new = qParam_old + learning_rate × evidence
+
+Where:
+- qParam are the Dirichlet parameters (uncertainty about model parameters)
+- evidence = how much this experience supports different parameter values
+- learning_rate controls how fast the agent adapts to new experiences
+
+For A matrix learning:
+evidence = outer_product(observation, state_belief)
+
+For B matrix learning:
+evidence = outer_product(current_state_belief, previous_state_belief)
+
+For D vector learning:
+evidence = initial_state_belief
+
+EXAMPLE:
+Agent believes A[vision][bright_obs, bright_room] = 0.8 (80% chance)
+Agent experiences: bright_room → dark_obs (unexpected!)
+Learning: Increase A[vision][dark_obs, bright_room] and decrease A[vision][bright_obs, bright_room]
+"""
+
 import numpy as np
 from pymdp import utils, maths
 import copy
@@ -59,53 +116,98 @@ def update_obs_likelihood_dirichlet(pA, A, obs, qs, lr=1.0, modalities="all"):
 
 def update_obs_likelihood_dirichlet_factorized(pA, A, obs, qs, A_factor_list, lr=1.0, modalities="all"):
     """ 
-    Update Dirichlet parameters of the observation likelihood distribution, in a case where the observation model is reduced (factorized) and only represents
-    the conditional dependencies between the observation modalities and particular hidden state factors (whose indices are specified in each modality-specific entry of ``A_factor_list``)
+    OBSERVATION MODEL LEARNING: Efficient Factorized Version
+    
+    This function learns the agent's observation model (A matrix) using the factorized approach.
+    It's the same as regular A matrix learning but computationally optimized for complex
+    environments where different observations depend on different state factors.
+    
+    THE BASIC IDEA:
+    The agent experiences: "I was in state X and observed Y"
+    Learning question: "How often does state X produce observation Y?"
+    The agent updates its A matrix to reflect this new evidence.
+    
+    FACTORIZATION OPTIMIZATION:
+    Instead of considering all state factors for every observation, this version only
+    updates the relevant state factors for each observation modality:
+    - Visual observations might only depend on [room_location, light_switch]
+    - Auditory observations might only depend on [sound_source, room_acoustics]
+    - This dramatically reduces computational cost while maintaining accuracy
+    
+    MATHEMATICAL FOUNDATION:
+    For each observation modality m:
+    evidence = outer_product(observation_m, relevant_state_beliefs)
+    qA_new[m] = qA_old[m] + learning_rate × evidence
+    
+    Only the state factors listed in A_factor_list[m] are used for modality m.
+    
+    WHEN TO USE:
+    - When different observations depend on different state factors
+    - Large state spaces where efficiency matters
+    - Most real-world scenarios (factorization is usually beneficial)
+    
+    EXAMPLE:
+    A_factor_list = [[0, 2], [1]]  # Vision depends on factors 0&2, sound depends on factor 1
+    Agent sees bright_light in room_A with switch_on
+    → Only updates A[vision] using beliefs about [room_location=A, light_switch=on]
+    → Doesn't waste computation on irrelevant hunger_level factor
 
     Parameters
     -----------
     pA: ``numpy.ndarray`` of dtype object
-        Prior Dirichlet parameters over observation model (same shape as ``A``)
+        Current Dirichlet parameters (uncertainty) about the observation model.
+        Higher values = more confident about those A matrix entries.
     A: ``numpy.ndarray`` of dtype object
-        Sensory likelihood mapping or 'observation model', mapping from hidden states to observations. Each element ``A[m]`` of
-        stores an ``numpy.ndarray`` multidimensional array for observation modality ``m``, whose entries ``A[m][i, j, k, ...]`` store 
-        the probability of observation level ``i`` given hidden state levels ``j, k, ...``
+        Current observation model: A[m][obs, state1, state2, ...] = P(observation | states)
+        This gets updated as the agent learns from experience.
     obs: 1D ``numpy.ndarray``, ``numpy.ndarray`` of dtype object, ``int`` or ``tuple``
-        The observation (generated by the environment). If single modality, this can be a 1D ``numpy.ndarray``
-        (one-hot vector representation) or an ``int`` (observation index)
-        If multi-modality, this can be ``numpy.ndarray`` of dtype object whose entries are 1D one-hot vectors,
-        or a ``tuple`` (of ``int``)
-    qs: 1D ``numpy.ndarray`` or ``numpy.ndarray`` of dtype object, default None
-        Marginal posterior beliefs over hidden states at current timepoint.
+        The observation that was actually received from the environment.
+        This provides the evidence for learning what observations occur in which states.
+    qs: 1D ``numpy.ndarray`` or ``numpy.ndarray`` of dtype object
+        The agent's current beliefs about what hidden states it's in.
+        This is needed because learning requires knowing: (state, action) → observation.
     A_factor_list: ``list`` of ``list`` of ``int``
-        List of lists, where each list with index `m` contains the indices of the hidden states that observation modality `m` depends on.
+        Factorization structure: A_factor_list[m] = which state factors affect observation modality m.
+        This enables computational efficiency by only updating relevant parameters.
     lr: float, default 1.0
-        Learning rate, scale of the Dirichlet pseudo-count update.
+        Learning rate: how fast the agent adapts to new experiences.
+        Higher lr = faster adaptation, Lower lr = more stable learning.
     modalities: ``list``, default "all"
-        Indices (ranging from 0 to ``n_modalities - 1``) of the observation modalities to include 
-        in learning. Defaults to "all", meaning that modality-specific sub-arrays of ``pA``
-        are all updated using the corresponding observations.
+        Which observation modalities to update. Use "all" to update all modalities,
+        or provide a list of indices to update only specific modalities.
     
     Returns
     -----------
     qA: ``numpy.ndarray`` of dtype object
-        Posterior Dirichlet parameters over observation model (same shape as ``A``), after having updated it with observations.
+        Updated Dirichlet parameters over observation model.
+        These represent the agent's new uncertainty/confidence about its observation model.
     """
 
+    # Get model dimensions
     num_modalities = len(pA)
     num_observations = [pA[modality].shape[0] for modality in range(num_modalities)]
 
+    # Process observation into standard format
     obs_processed = utils.process_observation(obs, num_modalities, num_observations)
     obs = utils.to_obj_array(obs_processed)
 
+    # Determine which modalities to update
     if modalities == "all":
         modalities = list(range(num_modalities))
 
+    # Initialize updated parameters with current values
     qA = copy.deepcopy(pA)
         
+    ### Update Each Observation Modality ###
     for modality in modalities:
+        # Compute evidence: outer product of observation and relevant state beliefs
+        # Only use state factors that actually affect this observation modality
         dfda = maths.spm_cross(obs[modality], qs[A_factor_list[modality]])
+        
+        # Apply mask to prevent learning impossible transitions (A matrix entries that are 0)
         dfda = dfda * (A[modality] > 0).astype("float")
+        
+        # Update Dirichlet parameters with scaled evidence
         qA[modality] = qA[modality] + (lr * dfda)
 
     return qA
@@ -162,49 +264,96 @@ def update_state_likelihood_dirichlet_interactions(
     pB, B, actions, qs, qs_prev, B_factor_list, lr=1.0, factors="all"
 ):
     """
-    Update Dirichlet parameters of the transition distribution, in the case when 'interacting' hidden state factors are present, i.e.
-    the dynamics of a given hidden state factor `f` are no longer independent of the dynamics of other hidden state factors.
+    TRANSITION MODEL LEARNING: Factorized Version with Interactions
+    
+    This function learns the agent's transition model (B matrix) using the factorized approach
+    with support for factor interactions. It handles cases where the dynamics of one state
+    factor depend on the states of other factors, not just its own previous state.
+    
+    THE BASIC IDEA:
+    The agent experiences: "I was in state X, took action A, and ended up in state Y"
+    Learning question: "How often does action A in state X lead to state Y?"
+    The agent updates its B matrix to reflect this new evidence about action effects.
+    
+    FACTOR INTERACTIONS:
+    In complex environments, one factor's dynamics might depend on other factors:
+    - Door opening might depend on both [door_state, key_possession]
+    - Room changing might depend on [current_room, door_states, navigation_action]
+    - Agent health might depend on [current_health, room_danger_level, protection_equipment]
+    
+    This version handles these dependencies efficiently using B_factor_list.
+    
+    MATHEMATICAL FOUNDATION:
+    For each state factor f:
+    evidence = outer_product(current_belief_f, previous_belief_relevant_factors)
+    qB_new[f][..., action] = qB_old[f][..., action] + learning_rate × evidence
+    
+    Only the factors listed in B_factor_list[f] influence factor f's dynamics.
+    
+    WHEN TO USE:
+    - Complex environments where state factors interact
+    - When efficiency matters (large state spaces)
+    - Most realistic scenarios (factors rarely completely independent)
+    
+    EXAMPLE:
+    B_factor_list = [[0], [0, 1, 2]]  # Factor 0 only depends on itself, factor 1 depends on 0,1,2
+    Agent: room=A, door=closed, key=yes → move_through_door → room=B, door=open, key=yes
+    → Updates B[room] using beliefs about [room, door, key] states
+    → More accurate learning of complex transition dynamics
 
     Parameters
     -----------
     pB: ``numpy.ndarray`` of dtype object
-        Prior Dirichlet parameters over transition model (same shape as ``B``)
+        Current Dirichlet parameters (uncertainty) about the transition model.
+        Higher values = more confident about those B matrix entries.
     B: ``numpy.ndarray`` of dtype object
-        Dynamics likelihood mapping or 'transition model', mapping from hidden states at ``t`` to hidden states at ``t+1``, given some control state ``u``.
-        Each element ``B[f]`` of this object array stores a 3-D tensor for hidden state factor ``f``, whose entries ``B[f][s, v, u]`` store the probability
-        of hidden state level ``s`` at the current time, given hidden state level ``v`` and action ``u`` at the previous time.
+        Current transition model: B[f][next_state, prev_state, action] = P(next_state | prev_state, action)
+        This gets updated as the agent learns from experience.
     actions: 1D ``numpy.ndarray``
-        A vector with length equal to the number of control factors, where each element contains the index of the action (for that control factor) performed at 
-        a given timestep.
+        The actions that were actually taken: actions[f] = action_index for control factor f.
+        This specifies which B matrix slices to update (the action dimension).
     qs: 1D ``numpy.ndarray`` or ``numpy.ndarray`` of dtype object
-        Marginal posterior beliefs over hidden states at current timepoint.
+        Agent's beliefs about current hidden states (where it ended up after the action).
+        This provides evidence for the "outcome" part of the transition.
     qs_prev: 1D ``numpy.ndarray`` or ``numpy.ndarray`` of dtype object
-        Marginal posterior beliefs over hidden states at previous timepoint.
+        Agent's beliefs about previous hidden states (where it was before the action).
+        This provides evidence for the "starting point" part of the transition.
     B_factor_list: ``list`` of ``list`` of ``int``
-        A list of lists, where each element ``B_factor_list[f]`` is a list of indices of hidden state factors that that are needed to predict the dynamics of hidden state factor ``f``.
-    lr: float, default ``1.0``
-        Learning rate, scale of the Dirichlet pseudo-count update.
+        Factor dependency structure: B_factor_list[f] = which factors influence factor f's dynamics.
+        This enables computational efficiency and models realistic factor interactions.
+    lr: float, default 1.0
+        Learning rate: how fast the agent adapts to new experiences.
+        Higher lr = faster adaptation, Lower lr = more stable learning.
     factors: ``list``, default "all"
-        Indices (ranging from 0 to ``n_factors - 1``) of the hidden state factors to include 
-        in learning. Defaults to "all", meaning that factor-specific sub-arrays of ``pB``
-        are all updated using the corresponding hidden state distributions and actions.
+        Which state factors to update. Use "all" to update all factors,
+        or provide a list of indices to update only specific factors.
 
     Returns
     -----------
     qB: ``numpy.ndarray`` of dtype object
-        Posterior Dirichlet parameters over transition model (same shape as ``B``), after having updated it with state beliefs and actions.
+        Updated Dirichlet parameters over transition model.
+        These represent the agent's new uncertainty/confidence about its transition model.
     """
 
     num_factors = len(pB)
 
+    # Initialize updated parameters with current values
     qB = copy.deepcopy(pB)
    
+    # Determine which factors to update
     if factors == "all":
         factors = list(range(num_factors))
 
+    ### Update Each State Factor ###
     for factor in factors:
+        # Compute evidence: outer product of current state belief and relevant previous state beliefs
+        # Only use the state factors that actually influence this factor's dynamics
         dfdb = maths.spm_cross(qs[factor], qs_prev[B_factor_list[factor]])
+        
+        # Apply mask to prevent learning impossible transitions (B matrix entries that are 0)
         dfdb *= (B[factor][...,int(actions[factor])] > 0).astype("float")
+        
+        # Update Dirichlet parameters for the specific action that was taken
         qB[factor][...,int(actions[factor])] += (lr*dfdb)
 
     return qB
@@ -213,37 +362,79 @@ def update_state_prior_dirichlet(
     pD, qs, lr=1.0, factors="all"
 ):
     """
-    Update Dirichlet parameters of the initial hidden state distribution 
-    (prior beliefs about hidden states at the beginning of the inference window).
+    INITIAL STATE LEARNING: Learning Typical Starting Conditions
+    
+    This function learns the agent's beliefs about what states episodes typically start in.
+    It updates the D vector based on evidence about initial states from multiple episodes.
+    
+    THE BASIC IDEA:
+    The agent observes: "Episodes tend to start in certain states more than others"
+    Learning question: "What are the typical starting conditions for new episodes?"
+    The agent updates its D vector to reflect these patterns.
+    
+    MATHEMATICAL FOUNDATION:
+    For each state factor f:
+    qD_new[f] = qD_old[f] + learning_rate × initial_state_evidence[f]
+    
+    Where initial_state_evidence comes from the agent's beliefs about states
+    at the beginning of inference windows or episodes.
+    
+    WHEN TO USE:
+    - Multi-episode learning scenarios
+    - When starting conditions vary across episodes
+    - Learning environment patterns and regularities
+    - Adapting to new environments with different starting distributions
+    
+    EXAMPLE:
+    - Environment: Sometimes start in kitchen (60%), sometimes bedroom (40%)
+    - Initial D: Uniform (25% each room)
+    - After experience: D updated to reflect kitchen=60%, bedroom=40%, others=0%
+    - Agent learns typical starting locations and can plan better from episode start
+    
+    WHY IT MATTERS:
+    Better initial state priors lead to:
+    - Faster convergence in state inference
+    - More realistic expectations about episode beginnings
+    - Better planning from the start of episodes
+    - Adaptation to environment-specific patterns
 
     Parameters
     -----------
     pD: ``numpy.ndarray`` of dtype object
-        Prior Dirichlet parameters over initial hidden state prior (same shape as ``qs``)
+        Current Dirichlet parameters (uncertainty) about initial state distribution.
+        Higher values = more confident about those starting state probabilities.
     qs: 1D ``numpy.ndarray`` or ``numpy.ndarray`` of dtype object
-        Marginal posterior beliefs over hidden states at current timepoint
-    lr: float, default ``1.0``
-        Learning rate, scale of the Dirichlet pseudo-count update.
+        Evidence about initial states: beliefs about hidden states at episode/window start.
+        This provides evidence for updating what states episodes typically begin in.
+    lr: float, default 1.0
+        Learning rate: how fast the agent adapts to new patterns in starting states.
+        Higher lr = faster adaptation, Lower lr = more stable learning.
     factors: ``list``, default "all"
-        Indices (ranging from 0 to ``n_factors - 1``) of the hidden state factors to include 
-        in learning. Defaults to "all", meaning that factor-specific sub-vectors of ``pD``
-        are all updated using the corresponding hidden state distributions.
+        Which state factors to update. Use "all" to update all factors,
+        or provide a list of indices to update only specific factors.
     
     Returns
     -----------
     qD: ``numpy.ndarray`` of dtype object
-        Posterior Dirichlet parameters over initial hidden state prior (same shape as ``qs``), after having updated it with state beliefs.
+        Updated Dirichlet parameters over initial hidden state prior.
+        These represent the agent's new uncertainty/confidence about starting state distributions.
     """
 
     num_factors = len(pD)
 
+    # Initialize updated parameters with current values
     qD = copy.deepcopy(pD)
    
+    # Determine which factors to update
     if factors == "all":
         factors = list(range(num_factors))
 
+    ### Update Each State Factor ###
     for factor in factors:
-        idx = pD[factor] > 0 # only update those state level indices that have some prior probability
+        # Only update state levels that have some prior probability (avoid impossible states)
+        idx = pD[factor] > 0
+        
+        # Add evidence for initial states, scaled by learning rate
         qD[factor][idx] += (lr * qs[factor][idx])
        
     return qD
