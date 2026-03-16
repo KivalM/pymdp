@@ -47,6 +47,29 @@ def generate_model_params():
             'no_list': num_obs_list, 
             'A_deps_list': A_deps_list}
 
+def make_simple_policy_model():
+    A = [jnp.array([[0.9, 0.1], [0.1, 0.9]], dtype=jnp.float32)]
+    B = [jnp.stack((jnp.eye(2, dtype=jnp.float32), jnp.array([[0.0, 1.0], [1.0, 0.0]], dtype=jnp.float32)), axis=-1)]
+    C = [jnp.array([[0.2, 0.8], [0.6, 0.4]], dtype=jnp.float32)]
+    pA = [1.0 + 4.0 * A[0]]
+    pB = [1.0 + 4.0 * B[0]]
+    qs_init = [jnp.array([0.55, 0.45], dtype=jnp.float32)]
+    policies = ctl_jax.construct_policies([2], [2], policy_len=2)
+    E = jnp.ones((policies.shape[0],), dtype=jnp.float32) / policies.shape[0]
+    return {
+        "A": A,
+        "B": B,
+        "C": C,
+        "E": E,
+        "pA": pA,
+        "pB": pB,
+        "qs_init": qs_init,
+        "policies": policies,
+        "A_dependencies": [[0]],
+        "B_dependencies": [[0]],
+        "I": [jnp.zeros((2, 1), dtype=jnp.float32)],
+    }
+
 class TestControlJax(unittest.TestCase):
 
     def test_get_expected_obs_factorized(self):
@@ -138,6 +161,67 @@ class TestControlJax(unittest.TestCase):
             info_gain_validation = ctl_np.calc_states_info_gain_factorized(A_np, [qs_numpy],  A_deps)
 
             self.assertTrue(np.allclose(info_gain, info_gain_validation, atol=1e-5))
+
+    def test_update_posterior_policies_inductive_diagnostics(self):
+        model = make_simple_policy_model()
+
+        q_pi, G = ctl_jax.update_posterior_policies_inductive(
+            model["policies"],
+            model["qs_init"],
+            model["A"],
+            model["B"],
+            model["C"],
+            model["E"],
+            model["pA"],
+            model["pB"],
+            model["A_dependencies"],
+            model["B_dependencies"],
+            model["I"],
+            use_param_info_gain=True,
+            use_inductive=False,
+        )
+
+        q_pi_diag, G_diag, diagnostics = ctl_jax.update_posterior_policies_inductive(
+            model["policies"],
+            model["qs_init"],
+            model["A"],
+            model["B"],
+            model["C"],
+            model["E"],
+            model["pA"],
+            model["pB"],
+            model["A_dependencies"],
+            model["B_dependencies"],
+            model["I"],
+            use_param_info_gain=True,
+            use_inductive=False,
+            return_diagnostics=True,
+        )
+
+        reconstructed = (
+            diagnostics["info_gain"]
+            + diagnostics["utility"]
+            - diagnostics["param_info_gain_a"]
+            - diagnostics["param_info_gain_b"]
+            + diagnostics["inductive_value"]
+        )
+
+        self.assertTrue(np.allclose(q_pi_diag, q_pi))
+        self.assertTrue(np.allclose(G_diag, G))
+        self.assertTrue(np.allclose(reconstructed, diagnostics["step_neg_G"]))
+        self.assertTrue(np.allclose(G_diag, diagnostics["step_neg_G"].sum(-1)))
+        self.assertEqual(diagnostics["info_gain"].shape, (model["policies"].shape[0], model["policies"].shape[1]))
+        self.assertEqual(diagnostics["utility"].shape, (model["policies"].shape[0], model["policies"].shape[1]))
+        self.assertEqual(diagnostics["param_info_gain_a"].shape, (model["policies"].shape[0], model["policies"].shape[1]))
+        self.assertEqual(diagnostics["param_info_gain_b"].shape, (model["policies"].shape[0], model["policies"].shape[1]))
+        self.assertEqual(
+            diagnostics["expected_states"][0].shape,
+            (model["policies"].shape[0], model["policies"].shape[1], model["qs_init"][0].shape[0]),
+        )
+        self.assertEqual(
+            diagnostics["expected_observations"][0].shape,
+            (model["policies"].shape[0], model["policies"].shape[1], model["A"][0].shape[0]),
+        )
     
 
 if __name__ == "__main__":

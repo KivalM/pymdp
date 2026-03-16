@@ -315,11 +315,13 @@ def compute_G_policy(qs_init, A, B, C, pA, pB, A_dependencies, B_dependencies, p
     qs_final, neg_G = final_state
     return neg_G
 
-def compute_G_policy_inductive(qs_init, A, B, C, pA, pB, A_dependencies, B_dependencies, I, policy_i, inductive_epsilon=1e-3, use_utility=True, use_states_info_gain=True, use_param_info_gain=False, use_inductive=False):
+def compute_G_policy_inductive(qs_init, A, B, C, pA, pB, A_dependencies, B_dependencies, I, policy_i, inductive_epsilon=1e-3, use_utility=True, use_states_info_gain=True, use_param_info_gain=False, use_inductive=False, return_diagnostics=False):
     """ 
     Write a version of compute_G_policy that does the same computations as `compute_G_policy` but using `lax.scan` instead of a for loop.
     This one further adds computations used for inductive planning.
     """
+
+    scalar_zero = jnp.zeros((), dtype=jtu.tree_leaves(qs_init)[0].dtype)
 
     def scan_body(carry, t):
 
@@ -329,34 +331,55 @@ def compute_G_policy_inductive(qs_init, A, B, C, pA, pB, A_dependencies, B_depen
 
         qo = compute_expected_obs(qs_next, A, A_dependencies)
 
-        info_gain = compute_info_gain(qs_next, qo, A, A_dependencies) if use_states_info_gain else 0.
+        info_gain = compute_info_gain(qs_next, qo, A, A_dependencies) if use_states_info_gain else scalar_zero
 
-        utility = compute_expected_utility(t, qo, C) if use_utility else 0.
+        utility = compute_expected_utility(t, qo, C) if use_utility else scalar_zero
 
-        inductive_value = calc_inductive_value_t(qs_init, qs_next, I, epsilon=inductive_epsilon) if use_inductive else 0.
+        inductive_value = calc_inductive_value_t(qs_init, qs_next, I, epsilon=inductive_epsilon) if use_inductive else scalar_zero
 
-        param_info_gain = 0.
-        if pA is not None:
-            param_info_gain += calc_pA_info_gain(pA, qo, qs_next, A_dependencies) if use_param_info_gain else 0.
-        if pB is not None:
-            param_info_gain += calc_pB_info_gain(pB, qs_next, qs, B_dependencies, policy_i[t]) if use_param_info_gain else 0.
+        param_info_gain_a = scalar_zero
+        if pA is not None and use_param_info_gain:
+            param_info_gain_a = calc_pA_info_gain(pA, qo, qs_next, A_dependencies)
 
-        neg_G += info_gain + utility - param_info_gain + inductive_value
+        param_info_gain_b = scalar_zero
+        if pB is not None and use_param_info_gain:
+            param_info_gain_b = calc_pB_info_gain(pB, qs_next, qs, B_dependencies, policy_i[t])
 
-        return (qs_next, neg_G), None
+        step_neg_G = info_gain + utility - param_info_gain_a - param_info_gain_b + inductive_value
+        neg_G += step_neg_G
+
+        diagnostics_t = None
+        if return_diagnostics:
+            diagnostics_t = {
+                "expected_states": qs_next,
+                "expected_observations": qo,
+                "info_gain": info_gain,
+                "utility": utility,
+                "param_info_gain_a": param_info_gain_a,
+                "param_info_gain_b": param_info_gain_b,
+                "inductive_value": inductive_value,
+                "step_neg_G": step_neg_G,
+            }
+
+        return (qs_next, neg_G), diagnostics_t
 
     qs = qs_init
-    neg_G = 0.
-    final_state, _ = lax.scan(scan_body, (qs, neg_G), jnp.arange(policy_i.shape[0]))
+    neg_G = scalar_zero
+    final_state, diagnostics = lax.scan(scan_body, (qs, neg_G), jnp.arange(policy_i.shape[0]))
     _, neg_G = final_state
+
+    if return_diagnostics:
+        return neg_G, diagnostics
+
     return neg_G
 
-def update_posterior_policies_inductive(policy_matrix, qs_init, A, B, C, E, pA, pB, A_dependencies, B_dependencies, I, gamma=16.0, inductive_epsilon=1e-3, use_utility=True, use_states_info_gain=True, use_param_info_gain=False, use_inductive=True):
+def update_posterior_policies_inductive(policy_matrix, qs_init, A, B, C, E, pA, pB, A_dependencies, B_dependencies, I, gamma=16.0, inductive_epsilon=1e-3, use_utility=True, use_states_info_gain=True, use_param_info_gain=False, use_inductive=True, return_diagnostics=False):
     # policy --> n_levels_factor_f x 1
     # factor --> n_levels_factor_f x n_policies
     ## vmap across policies
     compute_G_fixed_states = partial(compute_G_policy_inductive, qs_init, A, B, C, pA, pB, A_dependencies, B_dependencies, I, inductive_epsilon=inductive_epsilon,
-                                     use_utility=use_utility,  use_states_info_gain=use_states_info_gain, use_param_info_gain=use_param_info_gain, use_inductive=use_inductive)
+                                     use_utility=use_utility,  use_states_info_gain=use_states_info_gain, use_param_info_gain=use_param_info_gain, use_inductive=use_inductive,
+                                     return_diagnostics=return_diagnostics)
 
     # only in the case of policy-dependent qs_inits
     # in_axes_list = (1,) * n_factors
@@ -365,7 +388,15 @@ def update_posterior_policies_inductive(policy_matrix, qs_init, A, B, C, E, pA, 
     # policies needs to be an NDarray of shape (n_policies, n_timepoints, n_control_factors)
     neg_efe_all_policies = vmap(compute_G_fixed_states)(policy_matrix)
 
-    return nn.softmax(gamma * neg_efe_all_policies + log_stable(E)), neg_efe_all_policies
+    if return_diagnostics:
+        neg_efe_all_policies, diagnostics = neg_efe_all_policies
+
+    q_pi = nn.softmax(gamma * neg_efe_all_policies + log_stable(E))
+
+    if return_diagnostics:
+        return q_pi, neg_efe_all_policies, diagnostics
+
+    return q_pi, neg_efe_all_policies
 
 def generate_I_matrix(H: List[Array], B: List[Array], threshold: float, depth: int):
     """ 

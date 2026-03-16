@@ -380,12 +380,13 @@ class Agent(Module):
         
         return (pred, qs)
 
-    def infer_policies(self, qs: List):
+    def infer_policies(self, qs: List, return_diagnostics: bool = False):
         """
         Perform policy inference by optimizing a posterior (categorical) distribution over policies.
         This distribution is computed as the softmax of ``G * gamma + lnE`` where ``G`` is the negative expected
         free energy of policies, ``gamma`` is a policy precision and ``lnE`` is the (log) prior probability of policies.
         This function returns the posterior over policies as well as the negative expected free energy of each policy.
+        When ``return_diagnostics`` is ``True``, it also returns per-policy, per-iteration planning diagnostics.
 
         Returns
         ----------
@@ -393,6 +394,9 @@ class Agent(Module):
             Posterior beliefs over policies, i.e. a vector containing one posterior probability per policy.
         G: 1D ``numpy.ndarray``
             Negative expected free energies of each policy, i.e. a vector containing one negative expected free energy per policy.
+        diagnostics: pytree, optional
+            Per-policy planning diagnostics containing expected states, expected observations, and expected free energy
+            components for each rollout iteration.
         """
 
         latest_belief = jtu.tree_map(lambda x: x[:, -1], qs) # only get the posterior belief held at the current timepoint
@@ -404,10 +408,11 @@ class Agent(Module):
             use_utility=self.use_utility,
             use_states_info_gain=self.use_states_info_gain,
             use_param_info_gain=self.use_param_info_gain,
-            use_inductive=self.use_inductive
+            use_inductive=self.use_inductive,
+            return_diagnostics=return_diagnostics
         )
 
-        q_pi, G = vmap(infer_policies)(
+        policy_outputs = vmap(infer_policies)(
             latest_belief, 
             self.A,
             self.B,
@@ -420,6 +425,11 @@ class Agent(Module):
             inductive_epsilon=self.inductive_epsilon
         )
 
+        if return_diagnostics:
+            q_pi, G, diagnostics = policy_outputs
+            return q_pi, G, diagnostics
+
+        q_pi, G = policy_outputs
         return q_pi, G
     
     def multiaction_probabilities(self, q_pi: Array):
